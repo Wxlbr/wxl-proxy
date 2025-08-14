@@ -1,0 +1,16 @@
+# Maven / Java
+/target/
+.mvn
+
+# IDE files
+/.vscode/
+
+# Logs and temp
+/logs/
+*.log
+*.tmp
+
+# Project secrets / local configuration
+/.wxl/
+rootCA.key
+rootCA.crt
