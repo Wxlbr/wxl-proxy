@@ -7,57 +7,70 @@ import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.handler.codec.http.*;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
-import javax.net.ssl.SSLException;
 import io.netty.util.ReferenceCountUtil;
-import io.netty.buffer.ByteBuf;
-import io.netty.buffer.ByteBufHolder;
-import io.netty.buffer.ByteBufUtil;
-import java.nio.charset.StandardCharsets;
 
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.security.PrivateKey;
+import java.security.cert.X509Certificate;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicLong;
 
 final class ProxyFrontendHandler extends SimpleChannelInboundHandler<FullHttpRequest> {
 
     /**
      * ProxyFrontend to handle HTTP and CONNECT requests.
+     * and HTTPS MITM interception.
      */
 
-    // TODO: Use the CertificateAuthority in MITM mode for HTTPS interception
     private final CertificateAuthority ca;
+    private final BufferedReader consoleReader;
 
     ProxyFrontendHandler(CertificateAuthority ca) {
         super(false); // disable automatic release
         this.ca = ca;
+        this.consoleReader = new BufferedReader(new InputStreamReader(System.in));
     }
+
+    private void waitForUserInput(String prompt) {
+        // Wait for user to press Enter before forwarding the request/response
+        // Current placeholder for editing functionality
+        try {
+            System.out.println("\n" + prompt);
+            System.out.print("Press ENTER to continue...");
+            consoleReader.readLine();
+            System.out.println("Continuing...\n");
+        } catch (Exception e) {
+            System.err.println("Error reading user input: " + e.getMessage());
+        }
+    }
+
 
     @Override
     protected void channelRead0(ChannelHandlerContext ctx, FullHttpRequest req) {
         // Handle CONNECT requests for HTTP tunneling
 
         if (req.method().equals(HttpMethod.CONNECT)) {
+            // CONNECT request
             System.out.printf("CONNECT req %s from %s%n", req.uri(), ctx.channel().remoteAddress());
             handleConnect(ctx, req);
         } else {
+            // Regular HTTP request
             logHttpRequest(req, ctx);
             handleHttpForward(ctx, req);
         }
     }
 
     private void handleConnect(ChannelHandlerContext ctx, FullHttpRequest req) {
-
         final String hostAndPort = req.uri();
         FullHttpResponse resp = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.OK);
 
-        // Switch to a TLS tunnel
         ctx.writeAndFlush(resp).addListener(f -> {
-            // Remove HTTP codec and aggregator from pipeline
             ctx.pipeline().remove("httpCodec");
             ctx.pipeline().remove("aggregator");
             ctx.pipeline().remove(this);
-            
-            // Extract host and port
+
             final String targetHost;
             final int targetPort;
             if (hostAndPort.contains(":")) {
@@ -70,140 +83,130 @@ final class ProxyFrontendHandler extends SimpleChannelInboundHandler<FullHttpReq
             }
 
             final Channel client = ctx.channel();
-            System.out.printf("CONNECT %s — establishing tunnel%n", hostAndPort);
+            System.out.printf("CONNECT %s — establishing MITM tunnel%n", hostAndPort);
 
-            // TODO: MITM mode with CertificateAuthority
-            // For now, just tunnel raw TCP
-            // In future, generate dynamic certificate for the target
-            // and use a SslContext for the client connection
+            try {
+                // Generate dynamic cert for targetHost
+                X509Certificate cert = ca.getOrCreateCertForHost(targetHost);
+                PrivateKey key = ca.getPrivateKeyForHost(targetHost);
 
-            // Setup bootstrap for connecting to the target host
-            Bootstrap bootstrap = new Bootstrap()
-                    .group(client.eventLoop())
-                    .channel(NioSocketChannel.class)
-                    .handler(new ChannelInboundHandlerAdapter());
+                // Create SslContext for client side
+                try {
+                    SslContext sslCtx = SslContextBuilder
+                        .forServer(key, cert)
+                        .build();
 
-            // Connect to the target host
-            bootstrap.connect(targetHost, targetPort).addListener((ChannelFutureListener) connectFuture -> {
-                // If connection to origin fails, close client and log the cause
-                if (!connectFuture.isSuccess()) {
-                    System.out.printf("CONNECT %s — origin connect failed: %s%n", hostAndPort, connectFuture.cause());
+                    // Add SslHandler to pipeline
+                    client.pipeline().addFirst("ssl", sslCtx.newHandler(client.alloc()));
 
-                    // Send 502 Bad Gateway response to client
-                    FullHttpResponse failResp = new DefaultFullHttpResponse(
-                        HttpVersion.HTTP_1_1,
-                        HttpResponseStatus.BAD_GATEWAY
-                    );
-                    ctx.writeAndFlush(failResp).addListener(ChannelFutureListener.CLOSE);
-                    return;
+                    // Add HTTP handlers and a forwarding handler
+                    client.pipeline().addLast("httpCodec", new HttpServerCodec());
+                    client.pipeline().addLast("aggregator", new HttpObjectAggregator(1024 * 1024));
+                    client.pipeline().addLast("mitmForwarder", new SimpleChannelInboundHandler<FullHttpRequest>(false) {
+                        @Override
+                        protected void channelRead0(ChannelHandlerContext ctx2, FullHttpRequest req2) {
+                            logHttpRequest(req2, ctx2);
+                            handleHttpsForward(ctx2, req2, targetHost, targetPort);
+                        }
+                    });
+                } catch (Exception e) {
+                    e.printStackTrace();
+                    throw e;
                 }
 
-                final Channel origin = connectFuture.channel();
-                final AtomicLong upBytes = new AtomicLong();
-                final AtomicLong downBytes = new AtomicLong();
-
-                // Relay data from origin -> client (tunnel download)
-                origin.pipeline().addLast(new ChannelInboundHandlerAdapter() {
-
-                    @Override public void channelRead(ChannelHandlerContext originCtx, Object msg) {
-                        int len = countReadableBytes(msg);
-                        downBytes.addAndGet(len);
-                        logTunnelData(hostAndPort, "origin->client", msg);
-                        writeRetained(client, msg);
-                    }
-
-                    @Override public void channelInactive(ChannelHandlerContext originCtx) {
-                        System.out.printf("CONNECT %s closed (up=%d B, down=%d B)%n", hostAndPort, upBytes.get(), downBytes.get());
-                        if (client.isActive()) {
-                            client.close();
-                        }
-                    }
-                });
-
-                // Relay data from client -> origin (tunnel upload)
-                client.pipeline().addLast(new ChannelInboundHandlerAdapter() {
-
-                    @Override public void channelRead(ChannelHandlerContext clientCtx, Object msg) {
-                        int len = countReadableBytes(msg);
-                        upBytes.addAndGet(len);
-                        logTunnelData(hostAndPort, "client->origin", msg);
-                        writeRetained(origin, msg);
-                    }
-
-                    @Override public void channelInactive(ChannelHandlerContext clientCtx) {
-                        if (origin.isActive()) {
-                            origin.close();
-                        }
-                    }
-                });
-            });
+            } catch (Exception e) {
+                System.out.printf("MITM setup failed for %s: %s%n", hostAndPort, e);
+                client.close();
+            }
         });
     }
 
-    private void handleHttpForward(ChannelHandlerContext ctx, FullHttpRequest req) {
+    private void handleHttpsForward(ChannelHandlerContext ctx, FullHttpRequest req, String targetHost, int targetPort) {
+        // Forward HTTPS requests after ssl handshake (MITM)
+        
+        final long startNs = System.nanoTime();
+        final String path = req.uri();
 
-        // Extract host and port
+        // Intercept request
+        // TODO: allow user to edit request before forwarding
+        logHttpRequest(req, ctx);
+        waitForUserInput("\nINTERCEPTED HTTPS REQUEST to " + targetHost + ":" + targetPort + path);
+
+        // Connect to the origin server with TLS 
+        // Using Netty's InsecureTrustManagerFactory for testing 
+        // to avoid certificate validation issues
+        SslContext originSslCtx;
+        try {
+            originSslCtx = SslContextBuilder.forClient()
+                .trustManager(io.netty.handler.ssl.util.InsecureTrustManagerFactory.INSTANCE)
+                .build();
+        } catch (Exception e) {
+            System.out.printf("Failed to create origin SslContext for %s:%d: %s%n", targetHost, targetPort, e);
+            sendErrorResponse(ctx, HttpResponseStatus.INTERNAL_SERVER_ERROR);
+            return;
+        }
+
+        connectAndForward(ctx, req, targetHost, targetPort, path, originSslCtx, startNs, true);
+    }
+
+    private void handleHttpForward(ChannelHandlerContext ctx, FullHttpRequest req) {
+        // Forward plain HTTP requests (non-CONNECT)
+
         final long startNs = System.nanoTime();
         final URI uri = URI.create(req.uri());
         final String host = uri.getHost();
-        final boolean isHttps = "https".equalsIgnoreCase(uri.getScheme());
-        final int port = (uri.getPort() == -1) ? (isHttps ? 443 : 80) : uri.getPort();
+        final int port = (uri.getPort() == -1) ? 80 : uri.getPort();
 
-        // TODO: Replace raw HTTPS forwarding with MITM
-        // For now, just forward as-is
-
-        // Prepare origin TLS if required
-        final SslContext originSslCtx;
-        if (isHttps) {
-            try {
-                originSslCtx = SslContextBuilder.forClient().build();
-            } catch (SSLException e) {
-                System.out.printf("Failed to create origin SslContext for %s:%d: %s%n", host, port, e);
-                return;
-            }
-            
-        } else {
-            originSslCtx = null;
+        String path = (uri.getRawPath() == null || uri.getRawPath().isEmpty()) ? "/" : uri.getRawPath();
+        if (uri.getRawQuery() != null) {
+            path = path + "?" + uri.getRawQuery();
         }
 
-        // Create bootstrap for connecting to origin
+        // Intercept request
+        // TODO: allow user to edit request before forwarding
+        logHttpRequest(req, ctx);
+        waitForUserInput("\nINTERCEPTED HTTP REQUEST to " + req.uri());
+
+        connectAndForward(ctx, req, host, port, path, null, startNs, false);
+    }
+
+    private void connectAndForward(ChannelHandlerContext ctx, FullHttpRequest req, 
+                                   String targetHost, int targetPort, String path,
+                                   SslContext sslContext, long startNs, boolean isMitm) {
+        
+        // Connect to server and forward the request for both HTTP and HTTPS
+        String protocol = isMitm ? "HTTPS" : (sslContext != null ? "HTTPS" : "HTTP");
+
         Bootstrap bootstrap = new Bootstrap()
                 .group(ctx.channel().eventLoop())
                 .channel(NioSocketChannel.class)
                 .handler(new ChannelInitializer<Channel>() {
-
                     @Override
                     protected void initChannel(Channel ch) {
-
-                        // Add SSL handler if required
-                        // NOTE: This does not do MITM, just forwards HTTPS as-is when handling 
-                        // CONNECT requests. Full MITM would require generating a dynamic certificate
-                        if (originSslCtx != null) {
-                            ch.pipeline().addFirst(originSslCtx.newHandler(ch.alloc(), host, port));
+                        // Add SSL handler if needed
+                        if (sslContext != null) {
+                            ch.pipeline().addFirst(sslContext.newHandler(ch.alloc(), targetHost, targetPort));
                         }
-
-                        // Add HTTP client handlers
                         ch.pipeline().addLast(new HttpClientCodec());
                         ch.pipeline().addLast(new HttpObjectAggregator(1024 * 1024));
                         ch.pipeline().addLast(new SimpleChannelInboundHandler<HttpObject>(false) {
-
                             @Override
                             protected void channelRead0(ChannelHandlerContext ocx, HttpObject msg) {
-
-                                // Log HTTP response
                                 if (msg instanceof FullHttpResponse resp) {
                                     int status = resp.status().code();
                                     long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNs);
-                                    System.out.printf("HTTP %s %s <- %d (%d ms, %d B)%n",
-                                            req.method(), uri, status,
-                                            elapsedMs, resp.content() == null ? -1 : resp.content().readableBytes());
+                                    int bytes = resp.content() == null ? -1 : resp.content().readableBytes();
+                                    
+                                    System.out.printf("%s MITM %s %s:%d%s <- %d (%d ms, %d B)%n",
+                                            protocol, req.method(), targetHost, targetPort, path, status, elapsedMs, bytes);
                                     logHttpResponse(resp, ctx);
+                                    
+                                    // Intercept response
+                                    waitForUserInput("INTERCEPTED " + protocol + " RESPONSE (Status: " + status + ")");
                                 }
-
-                                // forward across channels — retain ownership
                                 ctx.writeAndFlush(ReferenceCountUtil.retain(msg));
                             }
-
+                            
                             @Override
                             public void channelInactive(ChannelHandlerContext ocx) {
                                 if (ctx.channel().isActive()) {
@@ -214,94 +217,35 @@ final class ProxyFrontendHandler extends SimpleChannelInboundHandler<FullHttpReq
                     }
                 });
 
-        // Connect to the origin server
-        bootstrap.connect(host, port).addListener((ChannelFutureListener) channelListener -> {
-
-            // Check if the connection was successful
+        bootstrap.connect(targetHost, targetPort).addListener((ChannelFutureListener) channelListener -> {
             if (!channelListener.isSuccess()) {
-                System.out.printf("HTTP forward: connect to %s:%d failed: %s%n", host, port, channelListener.cause());
-                
-                // Send 502 Bad Gateway response to client
-                FullHttpResponse failResp = new DefaultFullHttpResponse(
-                    HttpVersion.HTTP_1_1,
-                    HttpResponseStatus.BAD_GATEWAY
-                );
-                ctx.writeAndFlush(failResp).addListener(ChannelFutureListener.CLOSE);
+                System.out.printf("%s: connect to %s:%d failed: %s%n", protocol, targetHost, targetPort, channelListener.cause());
+                sendErrorResponse(ctx, HttpResponseStatus.BAD_GATEWAY);
                 return;
             }
-
-            Channel origin = channelListener.channel();
-
-            // Convert absolute-URI -> origin-form when necessary
-            FullHttpRequest forward;
-            if (uri.getScheme() != null) {
-
-                String path = (uri.getRawPath() == null || uri.getRawPath().isEmpty()) ? "/" : uri.getRawPath();
-                if (uri.getRawQuery() != null) {
-                    path = path + "?" + uri.getRawQuery();
-                }
-
-                // Create a new FullHttpRequest for the origin server
-                forward = new DefaultFullHttpRequest(req.protocolVersion(), req.method(), path, req.content().retain());
-                forward.headers().setAll(req.headers());
-                forward.headers().set(HttpHeaderNames.HOST, host + ((port == 80 || port == 443) ? "" : ":" + port));
             
-            } else {
-                forward = req.retain();
-            }
-
-            // Log the HTTP request being forwarded
+            Channel origin = channelListener.channel();
+            FullHttpRequest forward = new DefaultFullHttpRequest(req.protocolVersion(), req.method(), path, req.content().retain());
+            forward.headers().setAll(req.headers());
+            
+            // Set Host header
+            boolean isDefaultPort = (sslContext != null && targetPort == 443) || (sslContext == null && targetPort == 80);
+            forward.headers().set(HttpHeaderNames.HOST, targetHost + (isDefaultPort ? "" : ":" + targetPort));
+            
             origin.writeAndFlush(forward).addListener(f -> {
                 if (!f.isSuccess()) {
-                    System.out.printf("HTTP forward: write to origin failed: %s%n", f.cause());
-
-                    // Send 504 Gateway Timeout response to client
-                    FullHttpResponse failResp = new DefaultFullHttpResponse(
-                        HttpVersion.HTTP_1_1,
-                        HttpResponseStatus.GATEWAY_TIMEOUT
-                    );
-                    ctx.writeAndFlush(failResp).addListener(ChannelFutureListener.CLOSE);
+                    System.out.printf("%s: write to origin failed: %s%n", protocol, f.cause());
+                    sendErrorResponse(ctx, HttpResponseStatus.GATEWAY_TIMEOUT);
                     origin.close();
                 }
             });
         });
     }
 
-    private static int countReadableBytes(Object msg) {
-        if (msg instanceof io.netty.buffer.ByteBuf byteBuf) {
-            return byteBuf.readableBytes();
-        } else if (msg instanceof io.netty.buffer.ByteBufHolder byteBufHolder) {
-            return byteBufHolder.content().readableBytes();
-        }
-        return 0;
-    }
-
-    private static void writeRetained(Channel channel, Object msg) {
-        // Retain the message and write it to the channel
-        channel.writeAndFlush(ReferenceCountUtil.retain(msg));
-    }
-
-    private static void logTunnelData(String hostPort, String direction, Object msg) {
-        try {
-
-            ByteBuf byteBuf;
-            if (msg instanceof ByteBuf tmpByteBuf) {
-                byteBuf = tmpByteBuf;
-            } else if (msg instanceof ByteBufHolder byteBufHolder) {
-                byteBuf = byteBufHolder.content();
-            } else {
-                return;
-            }
-
-            int len = byteBuf.readableBytes();
-            int previewLen = Math.min(len, 64);
-            String hex = ByteBufUtil.hexDump(byteBuf, byteBuf.readerIndex(), previewLen);
-            String txt = byteBuf.toString(byteBuf.readerIndex(), previewLen, StandardCharsets.UTF_8);
-            System.out.printf("TUNNEL %s %s %dB preview(hex)=%s preview(txt)=%s%n", hostPort, direction, len, hex, txt);
-            
-        } catch (Throwable t) {
-            System.out.printf("Failed to log tunnel data: %s%n", t.toString());
-        }
+    private void sendErrorResponse(ChannelHandlerContext ctx, HttpResponseStatus status) {
+        // Send an error response and close the connection
+        FullHttpResponse failResp = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, status);
+        ctx.writeAndFlush(failResp).addListener(ChannelFutureListener.CLOSE);
     }
 
     private static void logHttpRequest(FullHttpRequest req, ChannelHandlerContext ctx) {
